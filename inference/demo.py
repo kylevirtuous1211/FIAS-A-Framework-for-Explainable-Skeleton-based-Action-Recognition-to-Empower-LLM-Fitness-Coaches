@@ -1,0 +1,346 @@
+# Usage (at /home/cvlab123): streamlit run demo.py
+
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+import av
+import cv2
+import threading
+from collections import deque
+import numpy as np
+import torch
+from pathlib import Path
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# imports for Hierarchical Loss
+import sys
+import os.path as osp
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..')))
+import fias_custom_loss.custom_loss  # <-- FORCE THE IMPORT
+
+
+# --- MMPose & MMAction Imports ---
+try:
+    from mmpose.apis import MMPoseInferencer
+    from mmaction.apis import inference_recognizer, init_recognizer
+except ImportError:
+    st.error("ImportError")
+    st.stop()
+
+
+# --- Page Setup ---
+st.set_page_config(page_title="FITS Demo", layout="wide")
+st.title("FIAS Demo")
+
+# --- Config ---
+path_prefix = Path('/home/cvlab123') 
+POSE_2D_CONFIG="/home/cvlab123/mmpose/configs/body_2d_keypoint/rtmpose/coco/rtmpose-l_8xb256-420e_aic-coco-256x192.py"
+POSE_2D_CHECKPOINT="/home/cvlab123/mmpose/checkpoints/rtmpose-l_simcc-aic-coco_pt-aic-coco_420e-256x192-f016ffe0_20230126.pth"
+ACTION_REC_CONFIG = path_prefix / 'mmaction2/configs/skeleton/custom_stgcnpp/stgcnpp_8xb16-joint-u100-80e_OurDataset-xsub-keypoint-2d.py'
+ACTION_REC_CHECKPOINT = '/home/cvlab123/mmaction2/work_dirs/1027_all_plus_idle100_2D_joint/best_acc_top1_epoch_8.pth'
+
+label_map = {
+    0: "lunge_correct", 1: "lunge_knee_pass_toe", 2: "lunge_too_high",
+    3: "push_up_arched_back", 4: "push_up_correct", 5: "push_up_elbow",
+    6: "squat_correct", 7: "squat_feet_too_close", 8: "squat_knees_inward"
+}
+
+# label_map = {
+#     0: "idle",
+#     1: "lunge_correct",
+#     2: "lunge_knee_pass_toe",
+#     3: "lunge_too_high",
+#     4: "push_up_arched_back",
+#     5: "push_up_correct",
+#     6: "push_up_elbow",
+#     7: "squat_correct",
+#     8: "squat_feet_too_close",
+#     9: "squat_knees_inward" # F FINETUNE ON QEVD, THERE IS NO KNEES INWARD
+# }
+
+@st.cache_resource
+def load_models():
+    try:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        
+        st.info(f"Loading models on {device}...")
+        
+        pose_inferencer = MMPoseInferencer(
+            pose2d=str(POSE_2D_CONFIG),
+            pose2d_weights=str(POSE_2D_CHECKPOINT),
+            device=device
+        )
+        
+        action_model = init_recognizer(
+            str(ACTION_REC_CONFIG),
+            str(ACTION_REC_CHECKPOINT),
+            device=device
+        )
+        
+        st.success("Models loaded successfully.")
+        return pose_inferencer, action_model
+
+    except Exception as e:
+        st.error(f"Model loading failed.: {e}")
+        return None, None
+
+pose_inferencer, action_model = load_models()
+
+
+# for thread safety
+class VideoProcessorV3:
+    def __init__(self, pose_inferencer, action_model, label_map):
+        self.lock = threading.Lock()
+        self.pose_inferencer = pose_inferencer
+        self.action_model = action_model
+        self.label_map = label_map
+        
+        # --- 優化參數 ---
+        self.pose_stride = 3 
+        self.action_stride = 10 
+        self.frame_counter = 0
+        # --- (結束) 優化參數 ---
+
+        self.keypoints_buffer = deque(maxlen=30)
+        self.scores_history = deque(maxlen=5) 
+        
+        self.latest_action = "N/A"
+        self.latest_score = 0.0
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        try:
+            # 1. 取得 BGR 影像 (OpenCV/MMPose 標準輸入)
+            img_bgr = frame.to_ndarray(format="bgr24")
+            self.frame_counter += 1
+            
+            # 預設使用 BGR 影像 (因為跳過幀時也要畫 BGR 文字)
+            vis_img_bgr = img_bgr 
+            action_to_update, score_to_update = None, None
+
+            # --- 1. 姿態辨識 (Pose Estimation) - Strided ---
+            run_pose_estimation = (self.frame_counter % self.pose_stride == 0)
+            
+            if run_pose_estimation:
+                # 傳入 BGR 影像給 MMPose
+                results_generator = self.pose_inferencer(img_bgr, show=False, return_vis=True)
+                result = next(results_generator)
+                
+                # MMPose 的視覺化會回傳 RGB 影像
+                vis_img_rgb = result.get('visualization', [img_bgr])[0] 
+
+                # *** 關鍵修正 1 ***
+                # 為了讓 cv2.putText 顏色正確，
+                # 我們把 MMPose 回傳的 RGB 影像 轉回 BGR
+                vis_img_bgr = cv2.cvtColor(vis_img_rgb, cv2.COLOR_RGB2BGR)
+
+
+                # --- (keypoints extraction, 保持不變) ---
+                if result['predictions'] and result['predictions'][0]:
+                    person_data = result['predictions'][0][0]
+                    keypoints = np.array(person_data['keypoints'], dtype=np.float32)
+                    keypoint_scores = np.array(person_data['keypoint_scores'], dtype=np.float32)
+                else:
+                    keypoints = np.zeros((17, 2), dtype=np.float32)
+                    keypoint_scores = np.zeros(17, dtype=np.float32)
+
+                self.keypoints_buffer.append({
+                    "keypoints": keypoints,
+                    "keypoint_scores": keypoint_scores
+                })
+
+                # --- 2. 動作辨識 (Action Recognition) - (保持不變) ---
+                buffer_is_full = (len(self.keypoints_buffer) == self.keypoints_buffer.maxlen)
+                run_action_recognition = (self.frame_counter % self.action_stride == 0)
+
+                if buffer_is_full and run_action_recognition:
+                    keypoints_list = [item['keypoints'] for item in self.keypoints_buffer]
+                    keypoint_scores_list = [item['keypoint_scores'] for item in self.keypoints_buffer]
+                    anno = {
+                        'keypoint': np.array(keypoints_list)[np.newaxis, ...],
+                        'keypoint_score': np.array(keypoint_scores_list)[np.newaxis, ...],
+                        'total_frames': len(keypoints_list),
+                        'img_shape': img_bgr.shape[:2] # 使用 BGR 影像的 shape
+                    }
+                    action_result = inference_recognizer(self.action_model, anno)
+                    current_scores = action_result.pred_score.cpu().numpy()
+                    self.scores_history.append(current_scores)
+                    avg_scores = np.mean(self.scores_history, axis=0)
+                    top_idx = avg_scores.argmax()
+                    top_score = avg_scores[top_idx]
+                    
+                    CONFIDENCE_THRESHOLD = 0.5
+                    if top_score > CONFIDENCE_THRESHOLD:
+                        action_to_update = self.label_map.get(top_idx, f"Unknown ({top_idx})")
+                        score_to_update = top_score
+                    else:
+                        action_to_update = "Idle"
+                        score_to_update = 0.0
+
+            # --- 3. 更新狀態 (Thread-Safe) - (保持不變) ---
+            with self.lock:
+                if action_to_update is not None:
+                    self.latest_action = action_to_update
+                    self.latest_score = score_to_update
+                action_for_drawing = self.latest_action
+                score_for_drawing = self.latest_score
+
+            # --- 4. 繪製文字 ---
+            # 現在 vis_img_bgr *永遠* 是 BGR 格式
+            
+            # (0, 255, 255) 在 BGR 中是 "黃色"
+            color_yellow = (0, 255, 255) 
+            
+            action_text = f"Action: {action_for_drawing}"
+            score_text = f"Score: {score_for_drawing:.2f}"
+            
+            # cv2.putText 會在 BGR 影像上正確繪製 BGR 黃色
+            cv2.putText(vis_img_bgr, action_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 4)
+            cv2.putText(vis_img_bgr, action_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color_yellow, 2)
+            cv2.putText(vis_img_bgr, score_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 4)
+            cv2.putText(vis_img_bgr, score_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, color_yellow, 2)
+            
+            
+            # *** 關鍵修正 2 ***
+            # 回傳給 streamlit-webrtc (av)
+            # 我們必須將 BGR 影像轉回 RGB
+            vis_img_rgb_final = cv2.cvtColor(vis_img_bgr, cv2.COLOR_BGR2RGB)
+            return av.VideoFrame.from_ndarray(vis_img_rgb_final, format="rgb24")
+        
+        except Exception as e:
+            # 錯誤處理...
+            error_img = frame.to_ndarray(format="bgr24")
+            cv2.putText(error_img, f"ERROR: {e}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # 將 BGR 錯誤影像轉為 RGB 回傳
+            error_img_rgb = cv2.cvtColor(error_img, cv2.COLOR_BGR2RGB)
+            return av.VideoFrame.from_ndarray(error_img_rgb, format="rgb24")
+
+# for thread safety
+class VideoProcessor:
+    def __init__(self, pose_inferencer, action_model, label_map):
+        self.lock = threading.Lock()
+        self.pose_inferencer = pose_inferencer
+        self.action_model = action_model
+        self.label_map = label_map
+        
+        # Custom frame buffer
+        self.keypoints_buffer = deque(maxlen=30)
+        self.scores_history = deque(maxlen=5)
+        
+        self.latest_action = "N/A"
+        self.latest_score = 0.0
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        try:
+            img = frame.to_ndarray(format="bgr24")
+
+            results_generator = self.pose_inferencer(img, show=False, return_vis=True)
+            result = next(results_generator)
+            
+            # keypoints extraction
+            if result['predictions'] and result['predictions'][0]:
+                person_data = result['predictions'][0][0]
+                keypoints = np.array(person_data['keypoints'], dtype=np.float32)
+                keypoint_scores = np.array(person_data['keypoint_scores'], dtype=np.float32)
+            else:
+                keypoints = np.zeros((17, 2), dtype=np.float32)
+                keypoint_scores = np.zeros(17, dtype=np.float32)
+
+            self.keypoints_buffer.append({
+                "keypoints": keypoints,
+                "keypoint_scores": keypoint_scores
+            })
+            
+            action_to_update, score_to_update = None, None
+            if len(self.keypoints_buffer) == self.keypoints_buffer.maxlen:
+                keypoints_list = [item['keypoints'] for item in self.keypoints_buffer]
+                keypoint_scores_list = [item['keypoint_scores'] for item in self.keypoints_buffer]
+                
+                anno = {
+                    'keypoint': np.array(keypoints_list)[np.newaxis, ...],
+                    'keypoint_score': np.array(keypoint_scores_list)[np.newaxis, ...],
+                    'total_frames': len(keypoints_list),
+                    'img_shape': img.shape[:2]
+                }
+                
+                action_result = inference_recognizer(self.action_model, anno)
+                
+                current_scores = action_result.pred_score.cpu().numpy()
+                self.scores_history.append(current_scores)
+                
+                top_idx = action_result.pred_score.argmax().item()
+                top_score = action_result.pred_score[top_idx].item()
+                
+                if self.scores_history:
+                    avg_scores = np.mean(self.scores_history, axis=0)
+                    top_idx = avg_scores.argmax()
+                    top_score = avg_scores[top_idx]
+                
+                CONFIDENCE_THRESHOLD = 0.5
+                if top_score > CONFIDENCE_THRESHOLD:
+                    action_to_update = self.label_map.get(top_idx, f"Unknown ({top_idx})")
+                    score_to_update = action_result.pred_score[top_idx].item()
+                else:
+                    action_to_update = "Idle"
+                    score_to_update = 0.0
+
+
+            with self.lock:
+                if action_to_update is not None:
+                    self.latest_action = action_to_update
+                    self.latest_score = score_to_update
+                
+                action_for_drawing = self.latest_action
+                score_for_drawing = self.latest_score
+
+            vis_img = result.get('visualization', [img])[0]
+            
+            buffer_len = len(self.keypoints_buffer)
+            buffer_text = f"Buffer: {buffer_len}/{self.keypoints_buffer.maxlen}"
+            action_text = f"Action: {action_for_drawing}"
+            score_text = f"Score: {score_for_drawing:.2f}"
+            
+            # cv2.putText(vis_img, buffer_text, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 4)
+            # cv2.putText(vis_img, buffer_text, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 100, 0), 2)
+            cv2.putText(vis_img, action_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 4)
+            cv2.putText(vis_img, action_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(vis_img, score_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 4)
+            cv2.putText(vis_img, score_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            
+            return av.VideoFrame.from_ndarray(vis_img, format="rgb24")
+        
+        except Exception as e:
+            error_img = frame.to_ndarray(format="bgr24")
+            cv2.putText(error_img, "ERROR", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            return av.VideoFrame.from_ndarray(error_img, format="rgb24")
+
+
+if pose_inferencer is None or action_model is None:
+    st.warning("No models loaded.")
+else:
+    if 'processor' not in st.session_state:
+        st.session_state.processor = VideoProcessor(pose_inferencer, action_model, label_map)
+
+    processor = st.session_state.processor
+
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col2:
+        
+        
+        webrtc_streamer(
+            key="camera-input-full-model",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=processor.recv,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+#     st.header("主畫面狀態 (需手動刷新)")
+#     col1, col2 = st.columns(2)
+#     with col1:
+#         st.metric("最新辨識動作", processor.latest_action)
+#     with col2:
+#         st.metric("可信度分數", f"{processor.latest_score:.2f}")
+# 
+#     if st.button("手動刷新狀態"):
+#         st.rerun()
+
