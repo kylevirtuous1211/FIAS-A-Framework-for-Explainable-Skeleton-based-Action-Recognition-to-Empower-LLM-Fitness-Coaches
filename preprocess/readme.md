@@ -14,8 +14,10 @@ This directory contains the scripts necessary to process raw video data into a f
 The end-to-end data preparation process is as follows:
 
 ### 1. Generate Keypoints from Videos
+We use mmpose's RTMPose for keypoints generation, please download the checkpoints inside mmpose
+➡️ **See instructions in: `~/mmpose/readme.md`**
 
-First, use the scripts in the `json_keypoints_generation/` directory to process your video dataset. This step uses pose estimation models (RTMPose for 2D and VideoPose3D for 3D) to extract skeletal data for each frame and saves it as a `.json` file for each video.
+After the mmpose's pipeline setup, use the scripts in the `json_keypoints_generation/` directory to process your video dataset. This step uses pose estimation models (RTMPose for 2D and VideoPose3D for 3D) to extract skeletal data for each frame and saves it as a `.json` file for each video.
 
 ➡️ **See instructions in: `json_keypoints_generation/readme.md`**
 
