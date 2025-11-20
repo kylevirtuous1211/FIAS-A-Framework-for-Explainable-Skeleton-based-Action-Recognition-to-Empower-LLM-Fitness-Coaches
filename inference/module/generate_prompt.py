@@ -1,6 +1,27 @@
 import numpy as np
 import json
 
+def generate_live_log_prompt(logs):
+    """
+    Generates a prompt based on time-series action logs instead of Grad-CAM.
+    
+    Args:
+        logs (list): List of strings like ["0sec: idle", "1sec: squat_correct", ...]
+    """
+    log_str = "\n".join(logs)
+    
+    prompt = (
+        f"You are an AI Fitness Coach. I have recorded a user's exercise session second-by-second. "
+        f"Here is the log of their detected actions:\n\n"
+        f"{log_str}\n\n"
+        f"Please analyze this performance:\n"
+        f"1. Identify the main exercise they were doing (e.g., Squat, Lunge, Pushup).\n"
+        f"2. Observe the consistency. Did they fluctuate between 'correct' and specific errors?\n"
+        f"3. If errors were detected (like 'knees_inward', 'too_high', 'arched_back'), explain what that means and how to fix it.\n"
+        f"4. Provide encouraging, short, and actionable feedback."
+    )
+    return prompt
+
 def generate_llm_prompt_en(gradcam_map, pred_name, pred_score, keypoint_names, total_frames):
     """
     Analyzes Grad-CAM data and generates a structured LLM prompt in English.
